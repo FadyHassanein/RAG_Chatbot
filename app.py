@@ -23,7 +23,8 @@ from tavily import TavilyClient
 
 # Load environment variables
 # load_dotenv()
-
+openai_api_key= st.secrets["api_keys"]["OPENAI_API_KEY"]
+tavily_api_key = st.secrets["api_keys"]["TAVILY_API_KEY"]
 # --- Page Configuration ---
 st.set_page_config(
     page_title="InsightAgentBot: Talk to Our Data & the Web",
