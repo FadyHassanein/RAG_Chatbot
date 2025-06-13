@@ -19,12 +19,16 @@ from pydantic import BaseModel, Field
 import time
 import ast
 from tavily import TavilyClient
+import requests
+from typing import Optional
 # from dotenv import load_dotenv
 
 # Load environment variables
 # load_dotenv()
+
 openai_api_key= st.secrets["api_keys"]["OPENAI_API_KEY"]
 tavily_api_key = st.secrets["api_keys"]["TAVILY_API_KEY"]
+
 # --- Page Configuration ---
 st.set_page_config(
     page_title="InsightAgentBot: Talk to Our Data & the Web",
@@ -95,7 +99,34 @@ def web_search_tool(query: str) -> str:
     output = "\n\n".join(response)
     return output
 
+def check_urls(urls, timeout=5):
+    """
+    Given a list of URLs, check each one and return a list of
+    (url, bool) indicating whether the URL is alive (HTTP status 2xx/3xx).
+    """
+    results = []
+    for url in urls:
+        try:
+            # Use HEAD for efficiency; fallback to GET if HEAD not allowed
+            resp = requests.head(url, timeout=timeout)
+            is_up = resp.status_code < 400
+        except requests.exceptions.RequestException:
+            is_up = False
+        results.append((url, is_up))
+    return results
 
+@tool
+def check_urls_status(urls: Optional[list[str]]):
+    """Useful tool to check whether the urls are working or not. Use this tool after `web_search_tool` to verify the URLs returned by the search before responding to the user.
+    Args:
+        urls: A list of URLs to check.
+    """
+    results=[]
+    for url, ok in check_urls(urls,):
+        status_text = "✅ OK" if ok else "❌ Not working"
+        results.append(f"{url}: {status_text}")
+
+    return results
 
 def get_session_history(session_id_str: str) -> BaseChatMessageHistory:
     """Retrieves or creates a chat history for a given session ID."""
@@ -165,7 +196,9 @@ if not st.session_state.chain_initialized:
 1.  **Understand User Query:** Interpret the user's natural language request.
 2.  **Database Search First:** Create a precise SQL query for the `data_table` and execute via `execute_sql_query` tool.
 3.  **Web Search Enhancement:** If database results are empty OR user specifically asks for "current", "recent", "latest market", or "updated" prices, use `web_search_tool` to find current market prices.
-4.  **Synthesize & Respond:** Analyze results from both tools and provide a comprehensive, natural language answer combining database and web findings.
+4.  **URL Verification:** ALWAYS use `check_urls_status` tool after `web_search_tool` to verify that the URLs returned are working.
+5.  **Re-search if Needed:** If `check_urls_status` shows all URLs are not working, filter them out and use `web_search_tool` again with different search terms to find working URLs.
+6.  **Synthesize & Respond:** Analyze results from all tools and provide a comprehensive, natural language answer combining database and verified web findings.
 
 **1. `data_table` Schema & Key Values:**
 *   **Prioritize Matching with Known Values:**
@@ -206,40 +239,56 @@ if not st.session_state.chain_initialized:
 *   **Search Query Construction:** Create focused search terms like "[Brand] [Model] price buy sell market" or "[Brand] [Model] current pricing dealers"
 *   **Results Processing:** Extract company names and their respective prices from web search results
 
-**4. Response Synthesis (Your Final Output to User):**
+**4. URL Status Verification (for `check_urls_status` tool):**
+*   **Mandatory Usage:** ALWAYS use `check_urls_status` immediately after `web_search_tool` to verify URL accessibility.
+*   **Input Format:** Pass all URLs returned by the web search tool for verification.
+*   **Filtering Logic:** 
+    *   If some URLs are working and some are not, use only the working URLs and their associated data in your response.
+    *   If ALL URLs are not working, discard the current web search results and perform a new `web_search_tool` query with alternative search terms.
+*   **Re-search Strategy:** When all URLs fail, try:
+    *   Different brand name variations (e.g., "HP" instead of "Hewlett Packard")
+    *   Alternative search terms (e.g., "used equipment dealers" or "test equipment marketplace")
+    *   Broader product categories if specific model searches fail
+
+**5. Response Synthesis (Your Final Output to User):**
 *   **Natural Language ONLY:** Your response to the user MUST be a helpful, human-readable sentence or paragraph. Do NOT output raw data, lists of numbers, or SQL queries.
 *   **Database + Web Results:** When combining both sources:
     *   Clearly distinguish between "database records" and "current market prices"
-    *   Present database findings first, then web search results
+    *   Present database findings first, then verified web search results
     *   Compare ranges and highlight differences if significant
 *   **Price Information:** 
     *   For database results: State the range and mention distinct prices found
-    *   For web results: List each company/seller with their respective prices (e.g., "Current market prices include: Company A at $X, Company B at $Y, Company C at $Z")
+    *   For web results: Only include information from verified working URLs, listing each company/seller with their respective prices (e.g., "Current market prices from verified sources include: Company A at $X, Company B at $Y, Company C at $Z")
     *   Use currency symbols and clear formatting
-*   **No Results:** If neither tool returns data, inform the user politely and suggest alternative search terms
+*   **No Results:** If neither tool returns data or all URLs are non-working after re-search attempts, inform the user politely and suggest alternative search terms
 
-**5. Enhanced Few-Shot Examples:**
+**6. Enhanced Few-Shot Examples:**
 
 *   **User Query:** "what is the current price of Agilent HP Keysight E4980A?"
     *   **Internal SQL:** `SELECT Price FROM data_table WHERE LOWER(EQBrand) = 'agilent hp keysight' AND LOWER(EQModel) = 'e4980a' ORDER BY Price ASC;`
     *   **Database Result:** `['Price': 5560, 'Price': 7000]`
     *   **Web Search Query:** "Agilent HP Keysight E4980A current price market dealers"
-    *   **Web Search Result:** Various sellers with current prices
-    *   **Your Response:** "Based on our database records, the Agilent HP Keysight E4980A has been listed at prices ranging from $5,560 to $7,000. Current market prices from web search show: TestMart at $8,200, EquipNet at $7,500, and TekDepot at $8,800. The current market prices appear to be higher than our historical database records."
+    *   **Web Search Result:** URLs and pricing from various sellers
+    *   **URL Status Check:** Verify all returned URLs
+    *   **URL Status Result:** 2 working URLs, 1 non-working URL
+    *   **Your Response:** "Based on our database records, the Agilent HP Keysight E4980A has been listed at prices ranging from $5,560 to $7,000. Current market prices from verified sources show: TestMart at $8,200 and EquipNet at $7,500. The current market prices appear to be higher than our historical database records."
 
 *   **User Query:** "Price for Keysight 34970A?"
     *   **Internal SQL:** `SELECT Price FROM data_table WHERE LOWER(EQBrand) LIKE '%keysight%' AND LOWER(EQModel) = '34970a';`
     *   **Database Result:** `[]` (empty)
     *   **Web Search Query:** "Keysight 34970A price buy market dealers"
-    *   **Web Search Result:** Multiple sellers found
-    *   **Your Response:** "I didn't find any records for the Keysight 34970A in our database. However, current market prices show: Electro Rent at $2,450, Test Equipment Connection at $2,150, and Axiom Test Equipment at $2,800."
+    *   **Web Search Result:** Multiple URLs returned
+    *   **URL Status Check:** All URLs are not working
+    *   **Re-search Query:** "Keysight 34970A used test equipment marketplace"
+    *   **Second URL Status Check:** 2 working URLs found
+    *   **Your Response:** "I didn't find any records for the Keysight 34970A in our database. However, current market prices from verified sources show: Electro Rent at $2,450 and Test Equipment Connection at $2,150."
 
 *   **User Query:** "Show me recent Tektronix oscilloscope prices"
     *   **Internal SQL:** `SELECT EQModel, Price FROM data_table WHERE LOWER(EQBrand) LIKE '%tektronix%' AND LOWER(EQModel) LIKE '%scope%' ORDER BY QID DESC LIMIT 5;`
     *   **Database Result:** Historical records found
     *   **Web Search Query:** "Tektronix oscilloscope current prices 2024"
-    *   **Your Response:** "From our database, recent Tektronix oscilloscope listings include [database results]. Current market prices from various dealers show [web search results with company names and prices]."""
-            # Pull the base agent prompt from Langchain Hub
+    *   **URL Status Check:** Mixed results - some working, some not
+    *   **Your Response:** "From our database, recent Tektronix oscilloscope listings include [database results]. Current market prices from verified dealers show [working URLs' pricing information with company names and prices]."""            # Pull the base agent prompt from Langchain Hub
             agent_prompt_template = hub.pull("hwchase17/openai-functions-agent")
 
             if hasattr(agent_prompt_template, 'messages') and \
@@ -251,7 +300,7 @@ if not st.session_state.chain_initialized:
                 st.error("Critical Error: Could not customize the agent's system prompt. The Langchain Hub prompt structure might have changed.")
                 st.stop()
 
-            tools_list = [execute_sql_query, web_search_tool]
+            tools_list = [execute_sql_query, web_search_tool, check_urls_status]
             openai_tools_agent = create_openai_tools_agent(
                 llm=chat_model,
                 tools=tools_list,
