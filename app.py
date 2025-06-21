@@ -21,12 +21,8 @@ import ast
 from tavily import TavilyClient
 import requests
 from typing import Optional
-# from dotenv import load_dotenv
+import urllib
 
-# Load environment variables
-# load_dotenv()
-openai_api_key= st.secrets["api_keys"]["OPENAI_API_KEY"]
-tavily_api_key = st.secrets["api_keys"]["TAVILY_API_KEY"]
 # --- Page Configuration ---
 st.set_page_config(
     page_title="InsightAgentBot: Talk to Our Data & the Web",
@@ -35,19 +31,66 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+openai_api_key= st.secrets["api_keys"]["OPENAI_API_KEY"]
+tavily_api_key = st.secrets["api_keys"]["TAVILY_API_KEY"]
+
 # --- Global Variables & Clients ---
-chat_model = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True, api_key=openai_api_key) # Using gpt-4o as a modern choice
-try:
-    db = SQLDatabase.from_uri("sqlite:///our_sql_database.db")
-except Exception as e:
-    st.error(f"Failed to connect to the database: {e}")
-    st.stop()
+chat_model = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True, api_key=openai_api_key)
+
+# db = SQLDatabase.from_uri("sqlite:///our_sql_database.db")
+
+# try:
+#     # --- DATABASE CONNECTION FOR MICROSOFT SQL SERVER ---
+#     # Replace with your actual username and password
+#     db_user = "user1080703"
+#     db_password = "homard"
+    
+#     # Connection string for MS SQL Server
+#     connection_string = (
+#         f"mssql+pyodbc://{db_user}:{db_password}@sirius1.ms-strategies.com,4123/pricetrack?"
+#         "driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
+#         )
+    
+#     db = SQLDatabase.from_uri(connection_string)
+
+# except Exception as e:
+#     st.error(f"Failed to connect to the database: {e}")
+#     st.stop()
+# Build your ODBC connection string exactly as you tested it:
+odbc_str = (
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=sirius1.ms-strategies.com,4123;"
+    "DATABASE=pricetrack;"
+    "UID=user1080703;"
+    "PWD=homard;"
+    "TrustServerCertificate=yes;"
+    "Connection Timeout=10;"
+)
+
+# URL-encode it for SQLAlchemy:
+quoted_conn = urllib.parse.quote_plus(odbc_str)
+
+@st.cache_resource(show_spinner=False)
+def get_sql_database():
+    try:
+        st.sidebar.info("🔌 Connecting to SQL Server…")
+        # Use the odbc_connect=… form
+        conn_uri = f"mssql+pyodbc:///?odbc_connect={quoted_conn}"
+        db = SQLDatabase.from_uri(conn_uri)
+        st.sidebar.success("✅ Connected!")
+        return db
+    except Exception as e:
+        st.sidebar.error(f"DB connection failed: {e}")
+        raise
+
+db = get_sql_database()
 
 tavily_client= TavilyClient(api_key=tavily_api_key)
 
 # In-memory store for chat histories
 store = {}
 # --- Helper Functions ---
+
 def query_as_list(db_conn, query_str):
     """Executes a SQL query and returns a cleaned list of unique results."""
     res = db_conn.run(query_str)
@@ -93,7 +136,14 @@ def web_search_tool(query: str) -> str:
     """A search engine optimized for comprehensive, accurate, and trusted results. Useful for when you need to answer questions about current prices of products. This tool delivers recent, accurate results
     query: a full complete target search query
     """
-    response = tavily_client.search(query= query,  search_depth="advanced", topic="general", include_raw_content= True)
+    response = tavily_client.search(
+        query= query,  
+        search_depth="advanced", 
+        topic="general", 
+        include_raw_content= True,
+        include_domains= ["used-line.com", "testunlimited.com", "ebay.com"],
+        max_results=10,
+        )
     response_formatted= [f"Result number {idx}:\nURL: {res['url']}.\n Content:{res['content']}.\n\n\n" for idx, res in enumerate(response["results"])]
     output = "\n\n".join(response_formatted)
     return output
@@ -188,20 +238,29 @@ if not st.session_state.chain_initialized:
     with st.spinner("Initializing AI Agent... Please wait."):
         try:
             # Fetch dynamic data for the prompt
-            companies_list = query_as_list(db, "SELECT DISTINCT CompanyName FROM data_table")
-            eqbrand_list = query_as_list(db, "SELECT DISTINCT EQBrand FROM data_table")
+            companies_list = query_as_list(db, "SELECT DISTINCT CompanyName FROM quotesresponses")
+            eqbrand_list = query_as_list(db, "SELECT DISTINCT EQBrand FROM quotesresponses")
 
             # Define the system prompt for the agent
-            system_message_str=f"""You are an **Intelligent SQL Query & Web Search Agent**. Your mission is to be a user-friendly interface to the `data_table` SQL database and provide current market pricing through web search when needed.
+            agent_prompt_template = hub.pull("hwchase17/openai-functions-agent")
+
+            system_message_str=f"""You are an **Intelligent SQL Query & Web Search Agent**. Your mission is to be a user-friendly interface to the `quotesresponses` SQL database and provide current market pricing through web search when needed.
+
 **Core Workflow:**
 1.  **Understand User Query:** Interpret the user's natural language request.
-2.  **Database Search First:** Create a precise SQL query for the `data_table` and execute via `execute_sql_query` tool.
+2.  **Database Search First:** Create a precise SQL query for the `quotesresponses` and execute via `execute_sql_query` tool.
 3.  **Web Search Enhancement:** If database results are empty OR user specifically asks for "current", "recent", "latest market", or "updated" prices, use `web_search_tool` to find current market prices.
 4.  **URL Verification:** ALWAYS use `check_urls_status` tool after `web_search_tool` to verify that the URLs returned are working.
 5.  **Re-search if Needed:** If `check_urls_status` shows all URLs are not working, filter them out and use `web_search_tool` again with different search terms to find working URLs.
 6.  **Synthesize & Respond:** Analyze results from all tools and provide a comprehensive, natural language answer combining database and verified web findings.
 
-**1. `data_table` Schema & Key Values:**
+**CRITICAL URL VALIDATION RULES:**
+*   **STRICT URL FILTERING:** You MUST NEVER include any URL in your response to the user unless it has been explicitly verified as working by the `check_urls_status` tool.
+*   **NO BROKEN LINKS:** Any URL that returns "not working" or "inaccessible" from `check_urls_status` MUST be completely excluded from your response.
+*   **MANDATORY VERIFICATION:** Every single URL obtained from `web_search_tool` MUST be passed through `check_urls_status` before being considered for inclusion.
+*   **ZERO TOLERANCE POLICY:** There are NO exceptions to this rule - if a URL is not validated as working, it cannot appear in your response under any circumstances.
+
+**1. `quotesresponses` Schema & Key Values:**
 *   **Prioritize Matching with Known Values:**
     *   For `CompanyName`, use: `<Known_Company_Names>{companies_list if companies_list else 'Not available'}</Known_Company_Names>`
     *   For `EQBrand`, use: `<Known_EQ_Brands>{eqbrand_list if eqbrand_list else 'Not available'}</Known_EQ_Brands>`
@@ -261,37 +320,48 @@ if not st.session_state.chain_initialized:
     *   For database results: State the range and mention distinct prices found
     *   For web results: Only include information from **verified working URLs**, listing each company/seller with their respective prices (e.g., "Current market prices from verified sources include: Company A at $X, Company B at $Y, Company C at $Z")
     *   Use currency symbols and clear formatting
-*   **URL Disclosure:** If web search was used, **always** append a **Sources:** section listing each **validated** URL returned by `web_search_tool` and confirmed by `check_urls_status`, so the user can verify your market data.
+*   **URL Disclosure:** If web search was used, **always** append a **Sources:** section listing ONLY the URLs that have been **explicitly validated as working** by `check_urls_status`, so the user can verify your market data.
 *   **No Results:** If neither tool returns data or all URLs are non-working after re-search attempts, inform the user politely and suggest alternative search terms
 
 **6. Enhanced Few-Shot Examples:**
 
 *   **User Query:** "what is the current price of Agilent HP Keysight E4980A?"
-    *   **Internal SQL:** `SELECT Price FROM data_table WHERE LOWER(EQBrand) = 'agilent hp keysight' AND LOWER(EQModel) = 'e4980a' ORDER BY Price ASC;`
+    *   **Internal SQL:** `SELECT Price FROM quotesresponses WHERE LOWER(EQBrand) = 'agilent hp keysight' AND LOWER(EQModel) = 'e4980a' ORDER BY Price ASC;`
     *   **Database Result:** `['Price': 5560, 'Price': 7000]`
     *   **Web Search Query:** "Agilent HP Keysight E4980A current price market dealers"
-    *   **Web Search Result:** URLs and pricing from various sellers
-    *   **URL Status Check:** Verify all returned URLs
-    *   **URL Status Result:** 2 working URLs, 1 non-working URL
-    *   **Your Response:** "Based on our database records, the Agilent HP Keysight E4980A has been listed at prices ranging from $5,560 to $7,000. Current market prices from verified sources show: TestMart at $8,200 and EquipNet at $7,500. The current market prices appear to be higher than our historical database records."
+    *   **Web Search Result:** 3 URLs returned
+    *   **URL Status Check:** 2 URLs working, 1 URL not working
+    *   **Your Response:** "Based on our database records, the Agilent HP Keysight E4980A has been listed at prices ranging from $5,560 to $7,000. Current market prices from verified sources show: TestMart at $8,200 and EquipNet at $7,500. The current market prices appear to be higher than our historical database records.
+
+**Sources:**
+- https://testmart.com/e4980a-price
+- https://equipnet.com/agilent-e4980a"
 
 *   **User Query:** "Price for Keysight 34970A?"
-    *   **Internal SQL:** `SELECT Price FROM data_table WHERE LOWER(EQBrand) LIKE '%keysight%' AND LOWER(EQModel) = '34970a';`
+    *   **Internal SQL:** `SELECT Price FROM quotesresponses WHERE LOWER(EQBrand) LIKE '%keysight%' AND LOWER(EQModel) = '34970a';`
     *   **Database Result:** `[]` (empty)
     *   **Web Search Query:** "Keysight 34970A price buy market dealers"
-    *   **Web Search Result:** Multiple URLs returned
-    *   **URL Status Check:** All URLs are not working
+    *   **Web Search Result:** 4 URLs returned
+    *   **URL Status Check:** All 4 URLs not working
     *   **Re-search Query:** "Keysight 34970A used test equipment marketplace"
-    *   **Second URL Status Check:** 2 working URLs found
-    *   **Your Response:** "I didn't find any records for the Keysight 34970A in our database. However, current market prices from verified sources show: Electro Rent at $2,450 and Test Equipment Connection at $2,150."
+    *   **Second URL Status Check:** 2 URLs working, 1 URL not working
+    *   **Your Response:** "I didn't find any records for the Keysight 34970A in our database. However, current market prices from verified sources show: Electro Rent at $2,450 and Test Equipment Connection at $2,150.
+
+**Sources:**
+- https://electrorent.com/keysight-34970a
+- https://testequipmentconnection.com/34970a-pricing"
 
 *   **User Query:** "Show me recent Tektronix oscilloscope prices"
-    *   **Internal SQL:** `SELECT EQModel, Price FROM data_table WHERE LOWER(EQBrand) LIKE '%tektronix%' AND LOWER(EQModel) LIKE '%scope%' ORDER BY QID DESC LIMIT 5;`
+    *   **Internal SQL:** `SELECT EQModel, Price FROM quotesresponses WHERE LOWER(EQBrand) LIKE '%tektronix%' AND LOWER(EQModel) LIKE '%scope%' ORDER BY QID DESC LIMIT 5;`
     *   **Database Result:** Historical records found
     *   **Web Search Query:** "Tektronix oscilloscope current prices 2024"
-    *   **URL Status Check:** Mixed results - some working, some not
-    *   **Your Response:** "From our database, recent Tektronix oscilloscope listings include [database results]. Current market prices from verified dealers show [working URLs' pricing information with company names and prices]."""            # Pull the base agent prompt from Langchain Hub
-            agent_prompt_template = hub.pull("hwchase17/openai-functions-agent")
+    *   **URL Status Check:** 3 URLs working, 2 URLs not working
+    *   **Your Response:** "From our database, recent Tektronix oscilloscope listings include [database results]. Current market prices from verified dealers show [working URLs' pricing information with company names and prices].
+
+**Sources:**
+- https://workingurl1.com/tektronix-scopes
+- https://workingurl2.com/oscilloscope-prices
+- https://workingurl3.com/tek-equipment" """
 
             if hasattr(agent_prompt_template, 'messages') and \
                len(agent_prompt_template.messages) > 0 and \
@@ -353,7 +423,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Database Information")
-    st.caption("The agent is connected to a SQLite database (`our_sql_database.db`). It can query tables like `data_table`.")
+    st.caption("The agent is connected to a Microsoft SQL Server database. It can query tables like `quotesresponses`.")
     # You could add more dynamic info here if needed, e.g., table names if fetched.
     # Example:
     # with st.expander("Show known tables"):
@@ -366,7 +436,7 @@ st.markdown("<sub>Powered by Langchain & OpenAI</sub>", unsafe_allow_html=True)
 
 # Display welcome message if chat is empty
 if not st.session_state.messages:
-    st.info("Welcome! I'm ready to help you query the database. Try asking something like: 'What are the distinct company names?' or 'How many records are in data_table?'")
+    st.info("Welcome! I'm ready to help you query the database. Try asking something like: 'What are the distinct company names?' or 'How many records are in quotesresponses?'")
 
 # Display chat messages
 for message in st.session_state.messages:
@@ -400,11 +470,6 @@ if prompt := st.chat_input("Ask a question about the database..."):
 
                 print(f"CONSOLE: Response stream container \n: {response_stream_container}")
                 
-                # The output of invoke with RunnableWithMessageHistory is typically the agent's final response dictionary.
-                # If 'output' key contains a generator (due to streaming=True in ChatOpenAI and how AgentExecutor handles it),
-                # then stream_agent_responses should handle that generator.
-                # The structure of response_stream_container needs to be handled carefully.
-                # If response_stream_container['output'] is the stream:
                 full_response_content = st.write_stream(stream_agent_responses(response_stream_container['output'], delay_seconds=0.01))
 
         except Exception as e:
