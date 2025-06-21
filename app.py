@@ -58,7 +58,7 @@ chat_model = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True, api_ke
 #     st.stop()
 # Build your ODBC connection string exactly as you tested it:
 odbc_str = (
-    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "DRIVER={ODBC Driver 17 for SQL Server};"
     "SERVER=sirius1.ms-strategies.com,4123;"
     "DATABASE=pricetrack;"
     "UID=user1080703;"
